@@ -1,6 +1,6 @@
 // Weekly service worker: network first, so a new version always wins when online;
 // the last good copy opens the app when offline. Caseload data lives in IndexedDB, never here.
-const CACHE = "weekly-1.2";
+const CACHE = "weekly-1.3";
 // On install, keep the page and every file it loads, so Weekly opens offline from the very first visit.
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -28,6 +28,9 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET" || new URL(request.url).origin !== self.location.origin) return;
+  // Weekly 1.3: the voice package and runtime are read from Cadence's folder and kept by the voice engine's own
+  // cache; never copy them into Weekly's cache.
+  if (!request.url.startsWith(self.registration.scope)) return;
   event.respondWith(
     fetch(request)
       .then((response) => {
