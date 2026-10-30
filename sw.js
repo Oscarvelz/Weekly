@@ -1,6 +1,6 @@
 // Weekly service worker: network first, so a new version always wins when online;
 // the last good copy opens the app when offline. Caseload data lives in IndexedDB, never here.
-const CACHE = "weekly-1.1.1";
+const CACHE = "weekly-1.1.2";
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => {
   event.waitUntil(
