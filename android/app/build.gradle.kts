@@ -28,3 +28,7 @@ android {
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
 }
+dependencies {
+    // android-4: FileProvider, so a backup can be handed to Android's share sheet.
+    implementation("androidx.core:core:1.13.1")
+}

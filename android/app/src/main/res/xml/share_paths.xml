@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- android-4: the only folder the share sheet can read is the app's own cache/share (one backup at a time). -->
+<paths>
+    <cache-path name="share" path="share/" />
+</paths>

@@ -22,6 +22,11 @@ import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
 import android.print.PrintManager
 import android.provider.MediaStore
+import android.provider.OpenableColumns
+import androidx.core.content.FileProvider
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import android.util.Base64
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -149,6 +154,7 @@ class MainActivity : Activity() {
         applyBars()
         addCrumb("shell start ${BuildConfig.VERSION_NAME}, WebView ${webViewVersion()}, Android ${android.os.Build.VERSION.RELEASE}")
         if (state != null) web.restoreState(state) else web.loadUrl(home)
+        if (state == null) takeIncoming(intent)
         checkUpdate()
     }
 
@@ -293,6 +299,12 @@ class MainActivity : Activity() {
         if (now - lastError < 10000) return
         lastError = now
         val msg = "The phone could not write into Documents/Weekly" + (e.message?.let { ": $it" } ?: ".")
+        dispatch("dispatchEvent(new CustomEvent('weeklyandroid-error',{detail:${JSONObject.quote(msg)}}))")
+    }
+
+    /** android-4: share and incoming failures say what failed (not the Documents/Weekly line). */
+    private fun reportShare(e: Throwable) {
+        val msg = "The backup could not be shared" + (e.message?.let { ": $it" } ?: ".")
         dispatch("dispatchEvent(new CustomEvent('weeklyandroid-error',{detail:${JSONObject.quote(msg)}}))")
     }
 
@@ -503,6 +515,54 @@ class MainActivity : Activity() {
             }
         }
         @JavascriptInterface fun print() = runOnUiThread { printPage() }
+        /**
+         * android-4: Share Backup. The page sends the package 1 MB at a time (base64), appended into cache/share/<name>,
+         * then shareFile opens Android's share sheet for it through the FileProvider.
+         */
+        // Written right here on the JavaBridge thread (never the UI thread): each call returns only when its 1 MB is on
+        // disk, so the page cannot run ahead and pile 128 MB up in memory, and a failure reaches the page as the answer.
+        // cache/share is only ever touched by these two calls, so this does not race the io thread.
+        @JavascriptInterface fun shareChunk(name: String, b64: String, first: Boolean): String {
+            val n = runCatching { clean(name).substringAfterLast('/') }.getOrElse { return "That file name cannot be used." }
+            return runCatching {
+                val bytes = Base64.decode(b64, Base64.DEFAULT)
+                val dir = File(cacheDir, "share")
+                if (first) { dir.deleteRecursively(); dir.mkdirs() }
+                FileOutputStream(File(dir, n), !first).use { it.write(bytes) }
+                "ok"
+            }.getOrElse { e -> "The backup could not be shared" + (e.message?.let { m -> ": $m" } ?: ".") }
+        }
+        @JavascriptInterface fun shareFile(name: String, mime: String): String {
+            val n = runCatching { clean(name).substringAfterLast('/') }.getOrElse { return "That file name cannot be used." }
+            val f = File(File(cacheDir, "share"), n)
+            if (!f.exists()) return "Nothing to share."
+            addCrumb("share backup: $n, ${f.length()} bytes")
+            runOnUiThread { openShare(f, mime) }
+            return "ok"
+        }
+        /** android-4: a backup shared to Weekly or opened with it, waiting for the page: {"name","size"} or "". */
+        @JavascriptInterface fun pendingIncoming(): String {
+            val f = incomingFile()
+            if (!f.exists()) return ""
+            return JSONObject().put("name", prefs.getString("incomingName", "Weekly backup.weekly")).put("size", f.length()).toString()
+        }
+        @JavascriptInterface fun incomingChunk(offset: Double, length: Int): String {
+            return runCatching {
+                RandomAccessFile(incomingFile(), "r").use { raf ->
+                    val at = offset.toLong()
+                    val left = raf.length() - at
+                    if (at < 0 || left <= 0 || length <= 0) {
+                        ""
+                    } else {
+                        val buf = ByteArray(minOf(length.toLong(), left).toInt())
+                        raf.seek(at)
+                        raf.readFully(buf)
+                        Base64.encodeToString(buf, Base64.NO_WRAP)
+                    }
+                }
+            }.getOrDefault("")
+        }
+        @JavascriptInterface fun incomingDone() { runCatching { incomingFile().delete() } }
         /** android-3: one breadcrumb line from the page, stored before this returns. */
         @JavascriptInterface fun crumb(text: String) { runCatching { addCrumb("web: $text") } }
         /** android-3: the breadcrumbs as text, and a copy onto the clipboard for a bug report. */
@@ -580,8 +640,64 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun openShare(f: File, mime: String) {
+        runCatching {
+            val uri = FileProvider.getUriForFile(this, "com.oscarvelz.weekly.files", f)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = mime.ifBlank { "application/octet-stream" }
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "Weekly backup")
+                clipData = ClipData.newRawUri(f.name, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "Share Weekly backup").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+        }.onFailure { reportShare(it) }
+    }
+
+    private fun incomingFile() = File(File(cacheDir, "incoming"), "backup")
+
+    /**
+     * android-4: a backup shared to Weekly (ACTION_SEND) or opened with it (ACTION_VIEW) is copied into
+     * cache/incoming on the IO thread, then the page is told; its Restore shows what the file holds before anything
+     * changes. On a cold start the page asks for it with pendingIncoming() once it has loaded.
+     */
+    private fun takeIncoming(incoming: Intent?): Boolean {
+        val i = incoming ?: return false
+        val action = i.action ?: return false
+        @Suppress("DEPRECATION")
+        val stream: Uri? = if (action == Intent.ACTION_SEND) i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) else null
+        val uri: Uri = when (action) {
+            Intent.ACTION_SEND -> stream ?: i.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            Intent.ACTION_VIEW -> i.data
+            else -> null
+        } ?: return false
+        val name = runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }.getOrNull() ?: uri.lastPathSegment?.substringAfterLast('/') ?: "Weekly backup.weekly"
+        addCrumb("incoming backup: ${name.take(80)}")
+        io.execute {
+            runCatching {
+                val dir = File(cacheDir, "incoming"); dir.mkdirs()
+                // Copied under a temporary name and renamed when complete, so the page never reads half a file.
+                val part = File(dir, "backup.part")
+                contentResolver.openInputStream(uri)?.use { input -> FileOutputStream(part).use { input.copyTo(it, 1 shl 20) } }
+                    ?: throw IllegalStateException("The shared file could not be opened.")
+                prefs.edit().putString("incomingName", name).commit()
+                val out = incomingFile()
+                out.delete()
+                if (!part.renameTo(out)) throw IllegalStateException("The shared file could not be kept.")
+                dispatch("dispatchEvent(new Event('weeklyandroid-incoming'))")
+            }.onFailure {
+                addCrumb("incoming backup failed: ${it.message?.take(120)}")
+                runOnUiThread { Toast.makeText(this@MainActivity, "That file could not be opened in Weekly.", Toast.LENGTH_LONG).show() }
+            }
+        }
+        return true
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (takeIncoming(intent)) return
         if (intent.action != "weekly.INSTALL") return
         when (intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -999)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
