@@ -2,9 +2,9 @@ Instala **Weekly.apk** en el teléfono o la tableta Android (11 o más nuevo).
 
 **Llave de firma nueva.** Esta versión está firmada con una llave nueva y privada (la anterior era pública y ya no se usa). Por eso **no se instala encima** de las versiones android-1 a android-4:
 
-1. Antes, en la app vieja: Ajustes › Copia de seguridad › guarda o comparte una copia (o confirma que ya tienes una reciente en Documentos › Weekly).
+1. Antes, en la app vieja: guarda una copia (Share Backup) o confirma que tienes una reciente en Documentos › Weekly.
 2. Desinstala Weekly e instala este Weekly.apk.
-3. Abre Weekly, entra con tu cuenta y, si hace falta, restaura la copia desde Ajustes eligiendo el archivo en Documentos › Weekly.
+3. Abre Weekly y restaura la copia con **Choose Backup File** › **Install Backup**, eligiendo el archivo en Documentos › Weekly.
 
 - La app abre https://oscarvelz.github.io/Weekly/ con su propio almacenamiento privado y guarda las copias en Documentos › Weekly.
 - Desde ahora las actualizaciones vuelven a instalarse solas encima, desde la propia app.
