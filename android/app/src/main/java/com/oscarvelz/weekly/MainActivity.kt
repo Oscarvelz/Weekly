@@ -5,13 +5,16 @@ import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.ContentUris
 import android.content.ContentValues
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.PackageInstaller
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.print.PageRange
 import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
@@ -50,6 +53,9 @@ class MainActivity : Activity() {
     private val io = Executors.newSingleThreadExecutor()
     private val store by lazy { Store() }
     private var lastError = 0L
+    /** The page's microphone request, waiting on Android's own permission dialog. */
+    private var micAsk: PermissionRequest? = null
+    private val crashes = ArrayList<Long>()
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -62,7 +68,7 @@ class MainActivity : Activity() {
         window.isStatusBarContrastEnforced = false
         WebView.setWebContentsDebuggingEnabled(true)
         root = FrameLayout(this)
-        web = WebView(this)
+        web = makeWeb()
         root.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         // Edge to edge: the page sits between the bars, and the bars show the root's colour (the theme's background).
         root.setOnApplyWindowInsetsListener { v, insets ->
@@ -73,7 +79,16 @@ class MainActivity : Activity() {
         }
         setContentView(root)
         applyBars()
-        web.settings.apply {
+        if (state != null) web.restoreState(state) else web.loadUrl(home)
+        checkUpdate()
+    }
+
+
+    /** Builds the page's WebView. Also used to start a fresh one if the page's process is ever lost. */
+    private fun makeWeb(): WebView {
+        val w = WebView(this)
+        w.setBackgroundColor(barColor)
+        w.settings.apply {
             javaScriptEnabled = true; domStorageEnabled = true; databaseEnabled = true
             cacheMode = WebSettings.LOAD_DEFAULT
             mediaPlaybackRequiresUserGesture = false; allowFileAccess = false; allowContentAccess = true
@@ -83,8 +98,8 @@ class MainActivity : Activity() {
         ServiceWorkerController.getInstance().serviceWorkerWebSettings.apply {
             cacheMode = WebSettings.LOAD_DEFAULT; allowContentAccess = true; allowFileAccess = false
         }
-        web.addJavascriptInterface(Bridge(), "WeeklyAndroid")
-        web.webViewClient = object : WebViewClient() {
+        w.addJavascriptInterface(Bridge(), "WeeklyAndroid")
+        w.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
                 val u = r.url
                 if (u.host == "oscarvelz.github.io" && (u.path ?: "").startsWith("/Weekly")) return false
@@ -97,21 +112,78 @@ class MainActivity : Activity() {
                     "<p>Weekly could not open. It needs the internet the first time; after that it opens offline.</p>" +
                     "<p><a style=\"color:#e0b45a\" href=\"$home\">Try again</a></p></body></html>", "text/html", "utf-8", null)
             }
+            // If the page's process dies (out of memory, say), Android would close the whole app unless the app
+            // says it handled it. Start a fresh page instead.
+            override fun onRenderProcessGone(v: WebView, detail: RenderProcessGoneDetail): Boolean {
+                recoverWeb(v)
+                return true
+            }
         }
-        web.webChromeClient = object : WebChromeClient() {
+        w.webChromeClient = object : WebChromeClient() {
             override fun onShowFileChooser(v: WebView, cb: ValueCallback<Array<Uri>>, p: FileChooserParams): Boolean {
                 fileCb?.onReceiveValue(null); fileCb = cb
                 val intent = p.createIntent()
                 if (p.mode == FileChooserParams.MODE_OPEN_MULTIPLE) intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                 return try { startActivityForResult(intent, 7); true } catch (e: Exception) { fileCb = null; false }
             }
+            // The page asks for the microphone (voice typing): pass it Android's own permission first.
+            override fun onPermissionRequest(r: PermissionRequest) {
+                val mic = r.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
+                if (!mic || r.origin?.host != "oscarvelz.github.io") { runCatching { r.deny() }; return }
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                    runCatching { r.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) }
+                    return
+                }
+                micAsk?.let { runCatching { it.deny() } }
+                micAsk = r
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 8)
+            }
+            override fun onPermissionRequestCanceled(r: PermissionRequest) {
+                if (micAsk === r) micAsk = null
+            }
         }
-        web.setDownloadListener { url, _, _, _, _ ->
+        w.setDownloadListener { url, _, _, _, _ ->
             // blob: and data: downloads are caught by the page and saved into Documents/Weekly; real links open outside.
             if (url.startsWith("http")) runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
         }
-        if (state != null) web.restoreState(state) else web.loadUrl(home)
-        checkUpdate()
+        return w
+    }
+
+    /** A fresh page after the old one's process was lost, so the app stays open instead of closing. */
+    private fun recoverWeb(dead: WebView) {
+        if (dead !== web) { runCatching { root.removeView(dead); dead.destroy() }; return }
+        micAsk?.let { runCatching { it.deny() } }
+        micAsk = null
+        root.removeView(dead)
+        runCatching { dead.destroy() }
+        val now = SystemClock.elapsedRealtime()
+        crashes.add(now)
+        crashes.removeAll { now - it > 60_000 }
+        web = makeWeb()
+        root.addView(web, 0, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        applyBars()
+        if (crashes.size >= 3) {
+            val bg = String.format("#%06X", 0xFFFFFF and barColor)
+            web.loadDataWithBaseURL(home, "<html><body style=\"background:$bg;color:#eee;font:18px sans-serif;padding:32px\">" +
+                "<p>Weekly had to reopen its page several times in a minute, so it is waiting here.</p>" +
+                "<p><a style=\"color:#e0b45a\" href=\"$home\">Open Weekly</a></p></body></html>", "text/html", "utf-8", null)
+        } else {
+            web.loadUrl(home)
+            Toast.makeText(this, "Weekly reopened its page after it stopped.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onRequestPermissionsResult(rq: Int, perms: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(rq, perms, results)
+        if (rq != 8) return
+        val r = micAsk ?: return
+        micAsk = null
+        if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) {
+            runCatching { r.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) }
+        } else {
+            runCatching { r.deny() }
+            Toast.makeText(this, "Voice typing needs the microphone. Allow it in Android Settings › Apps › Weekly › Permissions.", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun applyBars() {
