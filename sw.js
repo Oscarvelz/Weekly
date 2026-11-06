@@ -1,6 +1,6 @@
 // Weekly service worker: network first, so a new version always wins when online;
 // the last good copy opens the app when offline. Caseload data lives in IndexedDB, never here.
-const CACHE = "weekly-1.8.21";
+const CACHE = "weekly-1.9.0";
 // On install, keep the page and every file it loads, so Weekly opens offline from the very first visit.
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -59,11 +59,59 @@ async function precacheDict() {
 self.addEventListener("message", (event) => {
   if (event.data && event.data.type === "weekly-dict-precache") event.waitUntil(precacheDict().catch(() => undefined));
 });
+// Weekly 1.9.0 Read aloud. The voice models are kept by their engines in their own Cache Storage, shared with Logos
+// on this origin: Phonon in "phonon-tts-v1", PocketTTS in "pocket-tts-models-v2". The worker never copies them into a
+// weekly- cache. PocketTTS's small model descriptions (manifest.json, assets.json) are served from the phone at once
+// and refreshed behind, in the same "logos-pocket-meta" cache Logos uses, so the voice also opens offline.
+const POCKET_META = "logos-pocket-meta";
+// The engines' runtimes (.wasm, content-hashed) survive app updates: cache-first in their own cache, newest few kept.
+const WASM_CACHE = "wwasm-v1";
+// Cross-origin isolation (as in Logos, adapted from BetterTTS, MIT) lets the voice use several threads (Logos's
+// Turbo). credentialless keeps Hugging Face downloads working; other browsers get require-corp.
+const COEP = /Chrome\//.test(self.navigator.userAgent) ? "credentialless" : "require-corp";
+// Not inside the Weekly Android app: the app registers this worker as sw.js?app=1, and any Android WebView (its
+// user agent says "; wv)", the app adds "WeeklyAndroid/") counts too. There every response is served exactly as
+// before 1.9.0, with no isolation headers, so the shell's pages, its bridge and its backups never meet COEP, and
+// the voice runs on one thread.
+const IN_APP = new URL(self.location.href).searchParams.has("app") || /; wv\)|WeeklyAndroid\//.test(self.navigator.userAgent || "");
+function isolate(response) {
+  if (IN_APP || !response || response.type === "opaque" || response.status === 0) return response;
+  const headers = new Headers(response.headers);
+  headers.set("Cross-Origin-Embedder-Policy", COEP);
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  headers.set("Cross-Origin-Resource-Policy", "cross-origin");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+async function keepWasm(request, response) {
+  const cache = await caches.open(WASM_CACHE);
+  await cache.put(request, response);
+  const keys = await cache.keys();
+  for (const old of keys.slice(0, Math.max(0, keys.length - 8))) await cache.delete(old);
+}
 self.addEventListener("fetch", (event) => {
   const request = event.request;
-  if (request.method !== "GET" || new URL(request.url).origin !== self.location.origin) return;
-  if (request.url.startsWith(new URL(DICT_PATH, self.registration.scope).href)) {
+  if (request.method !== "GET") return;
+  const url = new URL(request.url);
+  if (url.hostname === "huggingface.co" && url.pathname.includes("/pocket-tts-onnx/") && url.pathname.endsWith(".json")) {
     event.respondWith(
+      caches.open(POCKET_META).then(async (cache) => {
+        const hit = await cache.match(request.url);
+        const refresh = fetch(request).then((res) => {
+          if (res.ok) void cache.put(request.url, res.clone());
+          return res;
+        });
+        if (hit) {
+          refresh.catch(() => undefined);
+          return hit;
+        }
+        return refresh;
+      }),
+    );
+    return;
+  }
+  if (url.origin !== self.location.origin) return;
+  if (request.url.startsWith(new URL(DICT_PATH, self.registration.scope).href)) {
+    event.respondWith(isolated(
       caches.open(DICT_CACHE).then((cache) =>
         cache.match(request).then(
           (hit) =>
@@ -74,13 +122,30 @@ self.addEventListener("fetch", (event) => {
             }),
         ),
       ),
-    );
+    ));
     return;
   }
   // Weekly 1.3: the voice package and runtime are read from Cadence's folder and kept by the voice engine's own
   // cache; never copy them into Weekly's cache.
   if (!request.url.startsWith(self.registration.scope)) return;
-  event.respondWith(
+  if (url.pathname.endsWith(".wasm")) {
+    event.respondWith(
+      isolated(
+        caches.open(WASM_CACHE).then((cache) =>
+          cache.match(request).then(
+            (hit) =>
+              hit ||
+              fetch(request).then((response) => {
+                if (response.ok && response.type === "basic") keepWasm(request, response.clone()).catch(() => undefined);
+                return response;
+              }),
+          ),
+        ),
+      ),
+    );
+    return;
+  }
+  event.respondWith(isolated(
     fetch(request)
       .then((response) => {
         if (response.ok) {
@@ -92,5 +157,8 @@ self.addEventListener("fetch", (event) => {
       .catch(() =>
         caches.match(request).then((hit) => hit || (request.mode === "navigate" ? caches.match("./index.html").then((page) => page || caches.match("./")) : undefined)).then((hit) => hit || Response.error()),
       ),
-  );
+  ));
 });
+function isolated(promise) {
+  return promise.then((response) => isolate(response));
+}
