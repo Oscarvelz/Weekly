@@ -1,0 +1,31 @@
+name: Weekly for Android
+on:
+  push:
+    branches: [main]
+    paths: ['android/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.9' }
+      - name: Build
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+        env:
+          KS_PASS: ${{ secrets.WEEKLY_KS_PASS || '2c36482290c4ec5f36a2fb5acebd8ac3' }}
+          VERSION_CODE: ${{ github.run_number }}
+      - run: cp android/app/build/outputs/apk/release/app-release.apk Weekly.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-${{ github.run_number }}
+          name: Weekly for Android ${{ github.run_number }}
+          body: Install Weekly.apk on the phone. The app opens https://oscarvelz.github.io/Weekly/ with its own private storage and keeps backups in Documents/Weekly.
+          files: Weekly.apk
+          make_latest: 'true'
