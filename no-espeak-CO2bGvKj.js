@@ -1,0 +1,1 @@
+function e(){throw Error(`espeak is not part of Weekly`)}export{e as default};
