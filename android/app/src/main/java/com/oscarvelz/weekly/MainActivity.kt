@@ -3,6 +3,8 @@ package com.oscarvelz.weekly
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.PendingIntent
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.ContentValues
 import android.Manifest
@@ -32,6 +34,9 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -56,6 +61,69 @@ class MainActivity : Activity() {
     /** The page's microphone request, waiting on Android's own permission dialog. */
     private var micAsk: PermissionRequest? = null
     private val crashes = ArrayList<Long>()
+    private val crumbLock = Any()
+
+    /**
+     * Breadcrumbs (android-3): the page and the shell leave short lines here before risky steps. Written with
+     * commit() (synchronous), so the last line is on disk even if the page's process dies right after it.
+     */
+    private fun addCrumb(text: String) {
+        val line = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US).format(Date()) + " " + text.replace('\n', ' ').take(200)
+        synchronized(crumbLock) {
+            val a = runCatching { JSONArray(prefs.getString("crumbs", "[]")) }.getOrElse { JSONArray() }
+            a.put(line)
+            val keep = JSONArray()
+            for (i in maxOf(0, a.length() - 30) until a.length()) keep.put(a.getString(i))
+            prefs.edit().putString("crumbs", keep.toString()).commit()
+        }
+    }
+
+    private fun crumbLines(): List<String> = synchronized(crumbLock) {
+        val a = runCatching { JSONArray(prefs.getString("crumbs", "[]")) }.getOrElse { JSONArray() }
+        (0 until a.length()).map { a.getString(it) }
+    }
+
+    private fun details(): String =
+        "Weekly for Android ${BuildConfig.VERSION_NAME}, Android ${android.os.Build.VERSION.RELEASE}, ${android.os.Build.MODEL}, WebView ${webViewVersion()}\n" +
+            crumbLines().joinToString("\n")
+
+    private fun webViewVersion(): String = runCatching { WebView.getCurrentWebViewPackage()?.versionName }.getOrNull() ?: "?"
+
+    private fun esc(t: String) = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+    /** The shell's own pages follow the remembered theme: dark text on a light (cream) background, light text on a dark one. */
+    private fun shellPage(message: String, link: String, crumbs: Boolean, autoOpenMs: Int): String {
+        val bg = String.format("#%06X", 0xFFFFFF and barColor)
+        val lum = (0.2126 * Color.red(barColor) + 0.7152 * Color.green(barColor) + 0.0722 * Color.blue(barColor)) / 255.0
+        val light = lum > 0.5
+        val fg = if (light) "#1f1a14" else "#eeeae4"
+        val muted = if (light) "#3f372d" else "#cfc8be"
+        val accent = if (light) "#8a4b0f" else "#e0b45a"
+        val box = if (light) "rgba(0,0,0,.06)" else "rgba(255,255,255,.07)"
+        val sb = StringBuilder()
+        sb.append("<html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>")
+        sb.append("<body style=\"background:$bg;color:$fg;font:18px/1.45 sans-serif;padding:28px;margin:0\">")
+        sb.append("<p style=\"margin:0 0 18px\">${esc(message)}</p>")
+        sb.append("<p style=\"margin:0 0 18px\"><a id=\"go\" style=\"color:$accent;font-weight:600\" href=\"$home\">${esc(link)}</a><span id=\"t\" style=\"color:$muted;font-size:15px\"></span></p>")
+        if (crumbs) {
+            val last = crumbLines().takeLast(8)
+            if (last.isNotEmpty()) {
+                sb.append("<p style=\"margin:0 0 6px;font-size:14px;color:$muted\">Last steps before it stopped:</p>")
+                sb.append("<pre style=\"white-space:pre-wrap;word-break:break-word;font:13px/1.4 monospace;color:$fg;background:$box;border-radius:10px;padding:10px;margin:0 0 12px\">")
+                sb.append(esc(last.joinToString("\n")))
+                sb.append("</pre>")
+                sb.append("<button id=\"cp\" style=\"font:15px sans-serif;color:$fg;background:$box;border:1px solid $accent;border-radius:10px;padding:9px 16px\">Copy details</button>")
+            }
+        }
+        sb.append("<script>")
+        sb.append("var left=${autoOpenMs / 1000},tm=null,t=document.getElementById('t');")
+        sb.append("function tick(){if(left<=0){location.href='$home';return;}t.textContent=' · opens in '+left+' s';left--;tm=setTimeout(tick,1000);}")
+        if (autoOpenMs > 0) sb.append("tick();")
+        sb.append("var cp=document.getElementById('cp');if(cp)cp.onclick=function(){if(tm){clearTimeout(tm);tm=null;t.textContent='';}")
+        sb.append("try{WeeklyAndroid.copyDetails();cp.textContent='Copied';}catch(e){cp.textContent='Could not copy';}};")
+        sb.append("</script></body></html>")
+        return sb.toString()
+    }
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -79,6 +147,7 @@ class MainActivity : Activity() {
         }
         setContentView(root)
         applyBars()
+        addCrumb("shell start ${BuildConfig.VERSION_NAME}, WebView ${webViewVersion()}, Android ${android.os.Build.VERSION.RELEASE}")
         if (state != null) web.restoreState(state) else web.loadUrl(home)
         checkUpdate()
     }
@@ -98,6 +167,9 @@ class MainActivity : Activity() {
         ServiceWorkerController.getInstance().serviceWorkerWebSettings.apply {
             cacheMode = WebSettings.LOAD_DEFAULT; allowContentAccess = true; allowFileAccess = false
         }
+        // Don't let Android treat the page's process as expendable while Weekly is on screen; when it is in the
+        // background the system may still reclaim it as usual (waivedWhenNotVisible = false keeps it important).
+        runCatching { w.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false) }
         w.addJavascriptInterface(Bridge(), "WeeklyAndroid")
         w.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
@@ -107,14 +179,19 @@ class MainActivity : Activity() {
             }
             override fun onReceivedError(v: WebView, r: WebResourceRequest, e: WebResourceError) {
                 if (!r.isForMainFrame) return
-                val bg = String.format("#%06X", 0xFFFFFF and barColor)
-                v.loadDataWithBaseURL(home, "<html><body style=\"background:$bg;color:#eee;font:18px sans-serif;padding:32px\">" +
-                    "<p>Weekly could not open. It needs the internet the first time; after that it opens offline.</p>" +
-                    "<p><a style=\"color:#e0b45a\" href=\"$home\">Try again</a></p></body></html>", "text/html", "utf-8", null)
+                v.loadDataWithBaseURL(home, shellPage("Weekly could not open. It needs the internet the first time; after that it opens offline.",
+                    "Try again", false, 0), "text/html", "utf-8", null)
             }
             // If the page's process dies (out of memory, say), Android would close the whole app unless the app
             // says it handled it. Start a fresh page instead.
             override fun onRenderProcessGone(v: WebView, detail: RenderProcessGoneDetail): Boolean {
+                val crashed = runCatching { detail.didCrash() }.getOrDefault(true)
+                val prio = when (runCatching { detail.rendererPriorityAtExit() }.getOrDefault(-1)) {
+                    WebView.RENDERER_PRIORITY_IMPORTANT -> "important"; WebView.RENDERER_PRIORITY_BOUND -> "bound"
+                    WebView.RENDERER_PRIORITY_WAIVED -> "waived"; else -> "unknown"
+                }
+                addCrumb(if (crashed) "PAGE PROCESS CRASHED (didCrash=true, priority at exit $prio)"
+                    else "PAGE PROCESS KILLED BY ANDROID, likely for memory (didCrash=false, priority at exit $prio)")
                 recoverWeb(v)
                 return true
             }
@@ -163,12 +240,12 @@ class MainActivity : Activity() {
         root.addView(web, 0, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         applyBars()
         if (crashes.size >= 3) {
-            val bg = String.format("#%06X", 0xFFFFFF and barColor)
-            web.loadDataWithBaseURL(home, "<html><body style=\"background:$bg;color:#eee;font:18px sans-serif;padding:32px\">" +
-                "<p>Weekly had to reopen its page several times in a minute, so it is waiting here.</p>" +
-                "<p><a style=\"color:#e0b45a\" href=\"$home\">Open Weekly</a></p></body></html>", "text/html", "utf-8", null)
+            web.loadDataWithBaseURL(home, shellPage("Weekly had to reopen its page several times in a minute, so it is waiting here.",
+                "Open Weekly", true, 0), "text/html", "utf-8", null)
         } else {
-            web.loadUrl(home)
+            // A short stop on the way back, so the last steps can be copied; it opens Weekly by itself.
+            web.loadDataWithBaseURL(home, shellPage("Weekly’s page stopped, so the app reopened it. Your caseload is safe.",
+                "Open Weekly now", true, 8000), "text/html", "utf-8", null)
             Toast.makeText(this, "Weekly reopened its page after it stopped.", Toast.LENGTH_SHORT).show()
         }
     }
@@ -426,6 +503,19 @@ class MainActivity : Activity() {
             }
         }
         @JavascriptInterface fun print() = runOnUiThread { printPage() }
+        /** android-3: one breadcrumb line from the page, stored before this returns. */
+        @JavascriptInterface fun crumb(text: String) { runCatching { addCrumb("web: $text") } }
+        /** android-3: the breadcrumbs as text, and a copy onto the clipboard for a bug report. */
+        @JavascriptInterface fun crumbs(): String = details()
+        @JavascriptInterface fun copyDetails() {
+            val text = details()
+            runOnUiThread {
+                runCatching {
+                    (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Weekly details", text))
+                    Toast.makeText(this@MainActivity, "Details copied.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
     /** Android printing for window.print(); the page hears 'afterprint' when the print screen closes, as in Chrome. */
