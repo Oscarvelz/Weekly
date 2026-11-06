@@ -1,0 +1,7 @@
+.env
+.env.*
+*.p12
+*.jks
+*.keystore
+*.pem
+*.key
