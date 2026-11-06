@@ -395,14 +395,18 @@ class MainActivity : Activity() {
                 runCatching { contentResolver.openInputStream(uri(e.id))?.use { it.readBytes() } }.getOrNull()?.let { hashes[path] = sha(it) }
             }
             if (e != null && hashes[path] == sum) return
-            val fresh = e == null
-            val u = if (e != null) uri(e.id) else create(path)
+            var fresh = e == null
+            var u = if (e != null) uri(e.id) else create(path)
             try {
                 contentResolver.openOutputStream(u, "wt")!!.use { it.write(bytes) }
             } catch (x: Exception) {
-                if (fresh) runCatching { contentResolver.delete(u, null, null) }
-                if (!fresh) { map.remove(path); hashes.remove(path) }
-                throw x
+                if (fresh) { runCatching { contentResolver.delete(u, null, null) }; throw x }
+                // A file under this name this install can't write (left by an earlier install, say): write a new entry
+                // instead; the phone suffixes its name ("name (1)") and the alias keeps it under the path asked for.
+                map.remove(path); hashes.remove(path); alias.edit().remove(path).apply()
+                u = create(path); fresh = true
+                try { contentResolver.openOutputStream(u, "wt")!!.use { it.write(bytes) } }
+                catch (y: Exception) { runCatching { contentResolver.delete(u, null, null) }; throw y }
             }
             if (fresh) done(u)
             hashes[path] = sum
@@ -415,9 +419,17 @@ class MainActivity : Activity() {
             val map = entries()
             val e = map[path]
             if (first || e == null) {
-                val fresh = e == null
-                val u = if (e != null) uri(e.id) else create(path)
-                contentResolver.openOutputStream(u, "wt")!!.use { it.write(bytes) }
+                var fresh = e == null
+                var u = if (e != null) uri(e.id) else create(path)
+                try { contentResolver.openOutputStream(u, "wt")!!.use { it.write(bytes) } }
+                catch (x: Exception) {
+                    if (fresh) { runCatching { contentResolver.delete(u, null, null) }; throw x }
+                    // Same as write(): a file this install can't write gets a new entry under the same path.
+                    map.remove(path); alias.edit().remove(path).apply()
+                    u = create(path); fresh = true
+                    try { contentResolver.openOutputStream(u, "wt")!!.use { it.write(bytes) } }
+                    catch (y: Exception) { runCatching { contentResolver.delete(u, null, null) }; throw y }
+                }
                 if (fresh) done(u)
                 map[path] = Entry(ContentUris.parseId(u), bytes.size.toLong(), System.currentTimeMillis())
             } else {
@@ -608,6 +620,8 @@ class MainActivity : Activity() {
             var url: String? = null
             for (i in 0 until list.length()) {
                 val r = list.getJSONObject(i)
+                // Releases marked pre-release (android-1..4, signed with the retired key) or drafts are never offered.
+                if (r.optBoolean("prerelease") || r.optBoolean("draft")) continue
                 val n = r.getString("tag_name").takeIf { it.startsWith("android-") }?.substringAfter("android-")?.toIntOrNull() ?: continue
                 if (n <= best) continue
                 val assets = r.getJSONArray("assets")

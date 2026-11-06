@@ -1,3 +1,7 @@
+# Weekly for Android: builds the shell from android/ on main. It never signs with a key from this repo and never
+# publishes a release by itself. Output: the UNSIGNED release APK as the artifact weekly-unsigned-<run number>,
+# which is signed privately and published from the orphan branch android-signed (release android-<run number>).
+# versionCode = run number, so each release must come from a newer run.
 name: Weekly for Android
 on:
   push:
@@ -5,7 +9,7 @@ on:
     paths: ['android/**', '.github/workflows/android.yml']
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,17 +19,14 @@ jobs:
         with: { distribution: temurin, java-version: '17' }
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.9' }
-      - name: Build
+      - name: Build (unsigned)
         working-directory: android
         run: gradle assembleRelease --no-daemon --stacktrace
         env:
-          KS_PASS: ${{ secrets.WEEKLY_KS_PASS || '2c36482290c4ec5f36a2fb5acebd8ac3' }}
           VERSION_CODE: ${{ github.run_number }}
-      - run: cp android/app/build/outputs/apk/release/app-release.apk Weekly.apk
-      - uses: softprops/action-gh-release@v2
+      - run: cp android/app/build/outputs/apk/release/app-release-unsigned.apk Weekly-unsigned.apk
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: android-${{ github.run_number }}
-          name: Weekly for Android ${{ github.run_number }}
-          body: Install Weekly.apk on the phone. The app opens https://oscarvelz.github.io/Weekly/ with its own private storage and keeps backups in Documents/Weekly.
-          files: Weekly.apk
-          make_latest: 'true'
+          name: weekly-unsigned-${{ github.run_number }}
+          path: Weekly-unsigned.apk
+          retention-days: 30
