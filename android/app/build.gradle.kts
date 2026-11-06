@@ -13,16 +13,23 @@ android {
         versionCode = code
         versionName = "1.$code"
     }
-    signingConfigs {
-        create("rel") {
-            storeFile = file("../weekly.p12")
-            storePassword = System.getenv("KS_PASS")
-            keyAlias = "weekly"
-            keyPassword = System.getenv("KS_PASS")
-            storeType = "pkcs12"
+    // Signing: never from a file in the repo. Only when the build is handed a keystore by path and password
+    // (WEEKLY_KS_FILE + WEEKLY_KS_PASS, e.g. decoded from GitHub secrets at runtime); otherwise the release APK is
+    // left unsigned and is signed privately afterwards (see the android-signed branch).
+    val ksFile = System.getenv("WEEKLY_KS_FILE")?.takeIf { it.isNotBlank() }
+    val ksPass = System.getenv("WEEKLY_KS_PASS")?.takeIf { it.isNotBlank() }
+    if (ksFile != null && ksPass != null) {
+        signingConfigs {
+            create("rel") {
+                storeFile = file(ksFile)
+                storePassword = ksPass
+                keyAlias = "weekly"
+                keyPassword = ksPass
+                storeType = "pkcs12"
+            }
         }
     }
-    buildTypes { release { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("rel") } }
+    buildTypes { release { isMinifyEnabled = false; signingConfigs.findByName("rel")?.let { signingConfig = it } } }
     buildFeatures { buildConfig = true }
     lint { checkReleaseBuilds = false; abortOnError = false }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
