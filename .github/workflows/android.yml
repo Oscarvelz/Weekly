@@ -1,7 +1,20 @@
-# Weekly for Android: builds the shell from android/ on main. It never signs with a key from this repo and never
-# publishes a release by itself. Output: the UNSIGNED release APK as the artifact weekly-unsigned-<run number>,
-# which is signed privately and published from the orphan branch android-signed (release android-<run number>).
-# versionCode = run number, so each release must come from a newer run.
+# Weekly for Android: builds the shell from android/ on main. The build job never signs and never
+# publishes: its output is the UNSIGNED release APK as the artifact weekly-unsigned-<run number>.
+#
+# The release job signs that artifact with apksigner and publishes release android-<run number>
+# (Weekly.apk). The keys live as ENVIRONMENT secrets of «release» -- WEEKLY_KS_B64 (base64 of the
+# PKCS12) and WEEKLY_KS_PASS, loaded by Oscar himself from Harks key files; the material never
+# transits chat or any AI. «release» requires Oscars approval, so the release job waits for his
+# tap in the Actions UI before it can touch the key: no push can become a signed release by
+# itself. versionCode = run number, so each release must come from a newer run (the next one
+# after this change is 6; android-5 was the last hand-published one).
+#
+# The signing key is the one created on 2026-11-06, which never lived in any repo: certificate
+# SHA-256 7cb379bb...d7e67861 (O=Weekly, CN=Oscar Velasquez). The verify step refuses to publish
+# anything signed with a different certificate -- the previously exposed key (c525edb5..., which
+# signed android-1 to android-4) must never come back. The old manual route stays as fallback:
+# without the environment secrets the release job no-ops, the unsigned artifact is signed
+# privately and published from the orphan branch android-signed as before.
 name: Weekly for Android
 on:
   push:
@@ -9,7 +22,10 @@ on:
     paths: ['android/**', '.github/workflows/android.yml']
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
+concurrency:
+  group: weekly-android
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,3 +46,63 @@ jobs:
           name: weekly-unsigned-${{ github.run_number }}
           path: Weekly-unsigned.apk
           retention-days: 30
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: release
+    concurrency:
+      group: weekly-android-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: weekly-unsigned-${{ github.run_number }}
+      - name: Are the signing secrets loaded?
+        env:
+          KS_B64: ${{ secrets.WEEKLY_KS_B64 }}
+          KS_PASS: ${{ secrets.WEEKLY_KS_PASS }}
+        run: |
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ]; then echo "SIGNED=1" >> "$GITHUB_ENV"; else echo "SIGNED=0" >> "$GITHUB_ENV"; fi
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ]; then echo "WEEKLY_KS_B64 / WEEKLY_KS_PASS are not loaded in the «release» environment -- keeping the unsigned artifact for manual signing (android-signed branch)."; fi
+      - name: Decode the keystore
+        if: env.SIGNED == '1'
+        env:
+          KS_B64: ${{ secrets.WEEKLY_KS_B64 }}
+        run: |
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/weekly.p12"
+          chmod 600 "$RUNNER_TEMP/weekly.p12"
+      - name: Sign with apksigner (alias weekly)
+        if: env.SIGNED == '1'
+        env:
+          KS_PASS: ${{ secrets.WEEKLY_KS_PASS }}
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          export PATH="$BT:$PATH"
+          zipalign -c -p 4 Weekly-unsigned.apk
+          apksigner sign --ks "$RUNNER_TEMP/weekly.p12" --ks-key-alias weekly --ks-pass env:KS_PASS --key-pass env:KS_PASS --out Weekly.apk Weekly-unsigned.apk
+      - name: Verify the signature is the Weekly key
+        if: env.SIGNED == '1'
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          export PATH="$BT:$PATH"
+          apksigner verify --print-certs Weekly.apk | tee certs.txt
+          DIGEST=$(grep "certificate SHA-256" certs.txt | head -1 | sed "s/.*: *" | tr -d ":" | tr "A-F" "a-f")
+          echo "certificate SHA-256: $DIGEST"
+          case "$DIGEST" in
+            7cb379bb*d7e67861) echo "Matches the Weekly signing key (2026-11-06)." ;;
+            *) echo "::error::Signed with the wrong certificate ($DIGEST) -- refusing to publish."; exit 1 ;;
+          esac
+      - name: Release
+        if: env.SIGNED == '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Weekly para Android ${{ github.run_number }}
+          body: Instala **Weekly.apk** en el teléfono o la tableta Android (11 o más nuevo). Firmada en CI tras la aprobación de Oscar (environment «release»).
+          files: Weekly.apk
+          make_latest: 'true'
+      - name: Remove the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/weekly.p12"
