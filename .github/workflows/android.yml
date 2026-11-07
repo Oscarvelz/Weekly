@@ -87,7 +87,7 @@ jobs:
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           export PATH="$BT:$PATH"
           apksigner verify --print-certs Weekly.apk | tee certs.txt
-          DIGEST=$(grep "certificate SHA-256" certs.txt | head -1 | sed "s/.*: *" | tr -d ":" | tr "A-F" "a-f")
+          DIGEST=$(grep "certificate SHA-256" certs.txt | head -1 | sed "s/.*: *//" | tr -d ":" | tr "A-F" "a-f")
           echo "certificate SHA-256: $DIGEST"
           case "$DIGEST" in
             7cb379bb*d7e67861) echo "Matches the Weekly signing key (2026-11-06)." ;;
