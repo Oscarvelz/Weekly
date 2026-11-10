@@ -365,20 +365,68 @@ class MainActivity : Activity() {
             else -> "application/octet-stream"
         }
 
-        private fun create(path: String): Uri {
-            val dir = path.substringBeforeLast('/', "")
-            val name = path.substringAfterLast('/')
+        private fun insertAs(dir: String, display: String, mimeType: String): Uri? {
             val v = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                put(MediaStore.MediaColumns.MIME_TYPE, mime(name))
+                put(MediaStore.MediaColumns.DISPLAY_NAME, display)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                 put(MediaStore.MediaColumns.RELATIVE_PATH, base + if (dir.isEmpty()) "" else "$dir/")
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
-            val u = contentResolver.insert(collection, v) ?: throw IllegalStateException("could not create $name")
-            contentResolver.query(u, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst() && c.getString(0) != name) alias.edit().putLong(path, ContentUris.parseId(u)).apply()
+            return runCatching { contentResolver.insert(collection, v) }.getOrNull()
+        }
+
+        /** A row the phone's file index holds for a file that is not really there (Oscar's phone,
+            2026-11-10: a leftover entry for account/ledger-package.json under Documents/WEEKLY -
+            size and date null, nothing readable behind it). While it stands, every insert at that
+            path dies with "Failed to build unique file" and no folder backup can be written.
+            Clear such phantom rows - index entries only, never a file that can actually be
+            read - so the path can be created again. */
+        private fun clearGhost(dir: String, name: String) {
+            val want = (base + if (dir.isEmpty()) "" else "$dir/").lowercase()
+            val proj = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.SIZE)
+            runCatching {
+                contentResolver.query(collection, proj, "${MediaStore.MediaColumns.DISPLAY_NAME}=?", arrayOf(name), null)?.use { c ->
+                    val ids = ArrayList<Long>()
+                    while (c.moveToNext()) {
+                        if ((c.getString(1) ?: "").lowercase() != want) continue
+                        val id = c.getLong(0)
+                        val phantom = c.isNull(2) || runCatching {
+                            contentResolver.openInputStream(uri(id))?.use { } ?: throw java.io.FileNotFoundException("unreadable")
+                        }.isFailure
+                        if (phantom) ids.add(id)
+                    }
+                    for (id in ids) runCatching { contentResolver.delete(uri(id), null, null) }
+                    if (ids.isNotEmpty()) index = null
+                }
             }
-            return u
+        }
+
+        private fun create(path: String): Uri {
+            val dir = path.substringBeforeLast('/', "")
+            val name = path.substringAfterLast('/')
+            var u = insertAs(dir, name, mime(name))
+            if (u == null) {
+                // The insert died (a phantom index row at this path is the known cause): clear
+                // phantoms and try the real name once more before falling back to a twin.
+                clearGhost(dir, name)
+                u = insertAs(dir, name, mime(name))
+            }
+            if (u == null) {
+                // Still blocked: write under a twin name ("ledger-package (1).json"); the alias
+                // recorded below keeps it filed under the path that was asked for.
+                val stem = name.substringBeforeLast('.', name)
+                val ext = name.substringAfterLast('.', "")
+                for (n in 1..3) {
+                    val twin = if (ext.isEmpty()) "$stem ($n)" else "$stem ($n).$ext"
+                    u = insertAs(dir, twin, mime(name))
+                    if (u != null) break
+                }
+            }
+            val uri = u ?: throw IllegalStateException("could not create $name")
+            contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst() && c.getString(0) != name) alias.edit().putLong(path, ContentUris.parseId(uri)).apply()
+            }
+            return uri
         }
 
         private fun done(u: Uri) {
