@@ -1,6 +1,6 @@
 // Weekly service worker: network first, so a new version always wins when online;
 // the last good copy opens the app when offline. Caseload data lives in IndexedDB, never here.
-const CACHE = "weekly-1.9.64";
+const CACHE = "weekly-1.9.65";
 // On install, keep the page and every file it loads, so Weekly opens offline from the very first visit.
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -59,12 +59,10 @@ async function precacheDict() {
 self.addEventListener("message", (event) => {
   if (event.data && event.data.type === "weekly-dict-precache") event.waitUntil(precacheDict().catch(() => undefined));
 });
-// Weekly 1.9.0 Read aloud. The voice models are kept by their engines in their own Cache Storage, shared with Logos
-// on this origin: Phonon in "phonon-tts-v1", PocketTTS in "pocket-tts-models-v2". The worker never copies them into a
-// weekly- cache. PocketTTS's small model descriptions (manifest.json, assets.json) are served from the phone at once
-// and refreshed behind, in the same "logos-pocket-meta" cache Logos uses, so the voice also opens offline.
-const POCKET_META = "logos-pocket-meta";
-// The engines' runtimes (.wasm, content-hashed) survive app updates: cache-first in their own cache, newest few kept.
+// Weekly read aloud. The voice model is kept by its engine in its own Cache Storage, shared with Logos
+// on this origin: Phonon in "phonon-tts-v1". The worker never copies it into a weekly- cache.
+// (1.9.65: the second engine, PocketTTS, was removed at Oscar's word; its caches are swept by the app.)
+// The engine's runtime (.wasm, content-hashed) survives app updates: cache-first in its own cache, newest few kept.
 const WASM_CACHE = "wwasm-v1";
 // Cross-origin isolation (as in Logos, adapted from BetterTTS, MIT) lets the voice use several threads (Logos's
 // Turbo). credentialless keeps Hugging Face downloads working; other browsers get require-corp.
@@ -92,23 +90,6 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
   const url = new URL(request.url);
-  if (url.hostname === "huggingface.co" && url.pathname.includes("/pocket-tts-onnx/") && url.pathname.endsWith(".json")) {
-    event.respondWith(
-      caches.open(POCKET_META).then(async (cache) => {
-        const hit = await cache.match(request.url);
-        const refresh = fetch(request).then((res) => {
-          if (res.ok) void cache.put(request.url, res.clone());
-          return res;
-        });
-        if (hit) {
-          refresh.catch(() => undefined);
-          return hit;
-        }
-        return refresh;
-      }),
-    );
-    return;
-  }
   if (url.origin !== self.location.origin) return;
   if (request.url.startsWith(new URL(DICT_PATH, self.registration.scope).href)) {
     event.respondWith(isolated(
