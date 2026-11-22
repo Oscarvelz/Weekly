@@ -380,10 +380,13 @@ class MainActivity : Activity() {
             size and date null, nothing readable behind it). While it stands, every insert at that
             path dies with "Failed to build unique file" and no folder backup can be written.
             Clear such phantom rows - index entries only, never a file that can actually be
-            read - so the path can be created again. */
+            read - so the path can be created again. A row whose backing file is gone from
+            disk counts as a phantom even when the provider still hands back a stream for it
+            (2026-11-22: the same refusal, this time on account/activity-log.txt, whose row
+            carried a null size and no file the write could land on). */
         private fun clearGhost(dir: String, name: String) {
             val want = (base + if (dir.isEmpty()) "" else "$dir/").lowercase()
-            val proj = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.SIZE)
+            val proj = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.DATA)
             runCatching {
                 contentResolver.query(collection, proj, "${MediaStore.MediaColumns.DISPLAY_NAME}=?", arrayOf(name), null)?.use { c ->
                     val ids = ArrayList<Long>()
@@ -391,12 +394,38 @@ class MainActivity : Activity() {
                         if ((c.getString(1) ?: "").lowercase() != want) continue
                         val id = c.getLong(0)
                         val phantom = c.isNull(2) || runCatching {
+                            val data = c.getString(3)
+                            if (data != null && !java.io.File(data).exists()) throw java.io.FileNotFoundException("no file behind the row")
                             contentResolver.openInputStream(uri(id))?.use { } ?: throw java.io.FileNotFoundException("unreadable")
                         }.isFailure
                         if (phantom) ids.add(id)
                     }
                     for (id in ids) runCatching { contentResolver.delete(uri(id), null, null) }
                     if (ids.isNotEmpty()) index = null
+                }
+            }
+        }
+
+        /** Last resort before a twin name: delete every index row still holding this exact
+            name in this folder. create() is only reached when no usable entry exists — the
+            indexed copy could not be opened for writing, or was never indexed at all — so a
+            row still standing here is by construction one this install cannot write, most
+            often a leftover of an earlier install. Deleting it frees the real name; a row
+            the phone refuses to delete (another owner's) simply leaves the twin fallback
+            below to carry the write. */
+        private fun clearBlocking(dir: String, name: String) {
+            val want = (base + if (dir.isEmpty()) "" else "$dir/").lowercase()
+            val proj = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH)
+            runCatching {
+                contentResolver.query(collection, proj, "${MediaStore.MediaColumns.DISPLAY_NAME}=?", arrayOf(name), null)?.use { c ->
+                    val ids = ArrayList<Long>()
+                    while (c.moveToNext()) {
+                        if ((c.getString(1) ?: "").lowercase() != want) continue
+                        ids.add(c.getLong(0))
+                    }
+                    var gone = false
+                    for (id in ids) gone = runCatching { contentResolver.delete(uri(id), null, null) > 0 }.getOrDefault(false) || gone
+                    if (gone) index = null
                 }
             }
         }
@@ -409,6 +438,13 @@ class MainActivity : Activity() {
                 // The insert died (a phantom index row at this path is the known cause): clear
                 // phantoms and try the real name once more before falling back to a twin.
                 clearGhost(dir, name)
+                u = insertAs(dir, name, mime(name))
+            }
+            if (u == null) {
+                // Still blocked: whatever row holds this name cannot be written by this
+                // install (write() reaches create() only after its own copy failed), so
+                // clear the name itself and try once more before the twin.
+                clearBlocking(dir, name)
                 u = insertAs(dir, name, mime(name))
             }
             if (u == null) {
@@ -451,7 +487,11 @@ class MainActivity : Activity() {
                 if (fresh) { runCatching { contentResolver.delete(u, null, null) }; throw x }
                 // A file under this name this install can't write (left by an earlier install, say): write a new entry
                 // instead; the phone suffixes its name ("name (1)") and the alias keeps it under the path asked for.
+                // The stale row itself goes first (2026-11-22): left standing, it holds the name
+                // and the fresh insert dies on it with "Failed to build unique file" — deleting
+                // it is the same overwrite this write came to do, one step earlier.
                 map.remove(path); hashes.remove(path); alias.edit().remove(path).apply()
+                runCatching { contentResolver.delete(u, null, null) }
                 u = create(path); fresh = true
                 try { contentResolver.openOutputStream(u, "wt")!!.use { it.write(bytes) } }
                 catch (y: Exception) { runCatching { contentResolver.delete(u, null, null) }; throw y }
@@ -474,6 +514,7 @@ class MainActivity : Activity() {
                     if (fresh) { runCatching { contentResolver.delete(u, null, null) }; throw x }
                     // Same as write(): a file this install can't write gets a new entry under the same path.
                     map.remove(path); alias.edit().remove(path).apply()
+                    runCatching { contentResolver.delete(u, null, null) }
                     u = create(path); fresh = true
                     try { contentResolver.openOutputStream(u, "wt")!!.use { it.write(bytes) } }
                     catch (y: Exception) { runCatching { contentResolver.delete(u, null, null) }; throw y }
