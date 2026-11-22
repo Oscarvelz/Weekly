@@ -1,6 +1,6 @@
 // Weekly service worker: network first, so a new version always wins when online;
 // the last good copy opens the app when offline. Caseload data lives in IndexedDB, never here.
-const CACHE = "weekly-1.9.72";
+const CACHE = "weekly-1.9.73";
 // On install, keep the page and every file it loads, so Weekly opens offline from the very first visit.
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -28,8 +28,8 @@ self.addEventListener("activate", (event) => {
 // Weekly 1.8.7 dictionary: the data lives in its own cache, named by data version (not by app version), so app updates
 // never download it again. Shards are immutable per version folder, so they are served cache-first. The page asks for
 // the whole set once Weekly has been open a while (message "weekly-dict-precache"); a lookup also fills the cache.
-const DICT_CACHE = "wdict-v1";
-const DICT_PATH = "dict/v1/";
+const DICT_CACHE = "wdict-v2";
+const DICT_PATH = "dict/v2/";
 async function precacheDict() {
   const cache = await caches.open(DICT_CACHE);
   const base = new URL(DICT_PATH, self.registration.scope).href;
